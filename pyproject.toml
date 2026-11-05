@@ -1,0 +1,13 @@
+[project]
+name = "ai-field-developer-assessment"
+version = "1.0.0"
+description = "MCP server, MCP security gateway, streaming PII guardrail and resilient LLM router."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2.3,<3",
+    "pydantic>=2.11,<3",
+    "httpx>=0.28,<1",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "PyJWT>=2.9,<3",
+]
