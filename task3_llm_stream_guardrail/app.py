@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .errors import ERROR_CATALOG, UpstreamError, UpstreamTimeout, error_body
-from .guardrail import StreamGuard, guard_stream
+from .guardrail import TEXT_FIELDS, StreamGuard, guard_stream
 from .providers import ChatProvider
 from .redactor import Engine, default_engine, redact_text
 from .sse import SSEProtocolError, format_event
@@ -43,20 +43,34 @@ class ChatRequest(BaseModel):
 
 
 def _redact_completion(payload: dict[str, Any], engine: Engine) -> dict[str, Any]:
-    """Non-streaming replies are a single bounded JSON document, redacted in one pass."""
-    for choice in payload.get("choices", []):
+    """Non-streaming replies are a single bounded JSON document, redacted in one pass.
+
+    Covers the same fields as the stream guard: the message text fields, tool and legacy function
+    call arguments, and the legacy ``text``. ``logprobs`` is replaced by ``null``.
+    """
+
+    def clean(container: dict[str, Any], name: str) -> None:
+        if isinstance(container.get(name), str):
+            container[name] = redact_text(container[name], engine)[0]
+
+    choices = payload.get("choices")
+    for choice in choices if isinstance(choices, list) else []:
         if not isinstance(choice, dict):
             continue
         message = choice.get("message")
-        if isinstance(message, dict) and isinstance(message.get("content"), str):
-            message["content"] = redact_text(message["content"], engine)[0]
-        if isinstance(message, dict) and isinstance(message.get("tool_calls"), list):
-            for call in message["tool_calls"]:
-                function = call.get("function") if isinstance(call, dict) else None
-                if isinstance(function, dict) and isinstance(function.get("arguments"), str):
-                    function["arguments"] = redact_text(function["arguments"], engine)[0]
-        if isinstance(choice.get("text"), str):
-            choice["text"] = redact_text(choice["text"], engine)[0]
+        if isinstance(message, dict):
+            for name in TEXT_FIELDS:
+                clean(message, name)
+            if isinstance(message.get("function_call"), dict):
+                clean(message["function_call"], "arguments")
+            if isinstance(message.get("tool_calls"), list):
+                for call in message["tool_calls"]:
+                    function = call.get("function") if isinstance(call, dict) else None
+                    if isinstance(function, dict):
+                        clean(function, "arguments")
+        clean(choice, "text")
+        if choice.get("logprobs") is not None:
+            choice["logprobs"] = None
     return payload
 
 

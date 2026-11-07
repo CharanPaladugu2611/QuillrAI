@@ -1,11 +1,17 @@
 """Applies the streaming redactor to an OpenAI-style chat completion event stream.
 
-The guard inspects normal generated text (``choices[].delta.content`` and legacy
-``choices[].text``) and streamed tool arguments
-(``choices[].delta.tool_calls[].function.arguments``). Each choice and tool call has
-an independent redactor, so PII remains protected when a provider splits it across
-arbitrary SSE events. Held-back tails are released *before* ``finish_reason`` or the
-closing ``[DONE]`` event, preserving ordering without accumulating the response.
+Every field a provider uses to carry generated text is inspected:
+
+* ``choices[].delta.<field>`` for each name in :data:`TEXT_FIELDS` (the answer, a refusal and
+  the reasoning a model exposes) and the legacy ``choices[].text``;
+* streamed tool arguments (``choices[].delta.tool_calls[].function.arguments``) and the legacy
+  ``choices[].delta.function_call.arguments``.
+
+Each of those is a separate stream of text with its own redactor, so PII remains protected
+when a provider splits it across arbitrary SSE events or interleaves fields. ``logprobs`` can
+not be redacted token by token (a value spans several tokens and the token strings repeat the
+text), so it is replaced by ``null``. Held-back tails are released *before* ``finish_reason``
+or the closing ``[DONE]`` event, preserving ordering without accumulating the response.
 """
 
 from __future__ import annotations
@@ -20,9 +26,14 @@ from typing import Any
 from .redactor import Engine, StreamRedactor, default_engine
 from .sse import DEFAULT_MAX_EVENT_BYTES, SSEEvent, SSEParser, format_event
 
+TEXT_FIELDS = ("content", "refusal", "reasoning_content", "reasoning")
+"""Names under which a delta, or a complete message, carries generated text."""
+
 _TEXT = "text"
+_FUNCTION = "function_call"
 _TOOL = "tool"
-RedactorKey = tuple[str, int, int]
+RedactorKey = tuple[str, int, str | int]  # (kind, choice index, field name or tool index)
+_BLANK_DELTA_KEYS = frozenset({*TEXT_FIELDS, "tool_calls", "function_call"})
 
 
 @dataclass(frozen=True)
@@ -32,6 +43,67 @@ class GuardStats:
     redactions: int
     max_buffered: int
     by_detector: dict[str, int] = field(default_factory=dict)
+
+
+def _joined(existing: Any, tail: str) -> str:
+    return (existing if isinstance(existing, str) else "") + tail
+
+
+def _tool_index(call: dict[str, Any], position: int) -> int:
+    index = call.get("index")
+    return index if isinstance(index, int) else position
+
+
+def _place(choice: dict[str, Any], key: RedactorKey, tail: str) -> None:
+    """Write a released ``tail`` where the stream for ``key`` carries its text."""
+    kind, _, name = key
+    if kind == _TEXT and name == "text":  # legacy completions keep the text on the choice itself
+        choice["text"] = _joined(choice.get("text"), tail)
+        return
+    delta = choice.get("delta")
+    if not isinstance(delta, dict):
+        delta = choice["delta"] = {}
+    if kind == _TEXT:
+        delta[name] = _joined(delta.get(name), tail)
+    elif kind == _FUNCTION:
+        call = delta.get("function_call")
+        if not isinstance(call, dict):
+            call = delta["function_call"] = {}
+        call["arguments"] = _joined(call.get("arguments"), tail)
+    else:
+        calls = delta.get("tool_calls")
+        if not isinstance(calls, list):
+            calls = delta["tool_calls"] = []
+        for position, call in enumerate(calls):
+            if isinstance(call, dict) and _tool_index(call, position) == name:
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    function = call["function"] = {}
+                function["arguments"] = _joined(function.get("arguments"), tail)
+                return
+        calls.append({"index": name, "function": {"arguments": tail}})
+
+
+def _string_holders(choice: dict[str, Any], choice_index: int) -> list[tuple[RedactorKey, dict[str, Any], str]]:
+    """Every string in ``choice`` that is a piece of generated text, as (stream, container, key)."""
+    holders: list[tuple[RedactorKey, dict[str, Any], str]] = []
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        for name in TEXT_FIELDS:
+            if isinstance(delta.get(name), str):
+                holders.append(((_TEXT, choice_index, name), delta, name))
+        call = delta.get("function_call")
+        if isinstance(call, dict) and isinstance(call.get("arguments"), str):
+            holders.append(((_FUNCTION, choice_index, "arguments"), call, "arguments"))
+        tool_calls = delta.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for position, tool in enumerate(tool_calls):
+                function = tool.get("function") if isinstance(tool, dict) else None
+                if isinstance(function, dict) and isinstance(function.get("arguments"), str):
+                    holders.append(((_TOOL, choice_index, _tool_index(tool, position)), function, "arguments"))
+    if isinstance(choice.get("text"), str):
+        holders.append(((_TEXT, choice_index, "text"), choice, "text"))
+    return holders
 
 
 class StreamGuard:
@@ -93,30 +165,29 @@ class StreamGuard:
             self._redactors[key] = StreamRedactor(self._engine)
         return self._redactors[key]
 
-    @staticmethod
-    def _text_key(choice_index: int) -> RedactorKey:
-        return (_TEXT, choice_index, -1)
-
-    @staticmethod
-    def _tool_key(choice_index: int, tool_index: int) -> RedactorKey:
-        return (_TOOL, choice_index, tool_index)
-
     def _release_tails(self) -> list[bytes]:
         events = []
-        for (kind, choice_index, tool_index), redactor in sorted(self._redactors.items()):
+        for key, redactor in sorted(self._redactors.items()):
             tail = redactor.flush()
             if not tail:
                 continue
-            if kind == _TEXT:
-                delta = {"content": tail}
-            else:
-                delta = {"tool_calls": [{"index": tool_index, "function": {"arguments": tail}}]}
-            chunk = {
-                **self._template,
-                "choices": [{"index": choice_index, "delta": delta, "finish_reason": None}],
-            }
+            choice: dict[str, Any] = {"index": key[1]}
+            _place(choice, key, tail)
+            choice["finish_reason"] = None
+            chunk = {**self._template, "choices": [choice]}
             events.append(format_event(json.dumps(chunk, separators=(",", ":"), ensure_ascii=False)))
         return events
+
+    def _release_choice_tails(self, choice: dict[str, Any], choice_index: int, carried: set[RedactorKey]) -> bool:
+        """On a choice's final event, add the held text of every stream that event did not carry."""
+        placed = False
+        for key, redactor in sorted(self._redactors.items()):
+            if key[1] == choice_index and key not in carried and redactor.pending:
+                tail = redactor.flush()
+                if tail:
+                    _place(choice, key, tail)
+                    placed = True
+        return placed
 
     def _handle(self, event: SSEEvent) -> list[bytes]:
         self._events_in += 1
@@ -141,34 +212,26 @@ class StreamGuard:
                 all_empty = False
                 continue
             choice_index = choice.get("index") if isinstance(choice.get("index"), int) else 0
-            redactor = self._redactor(self._text_key(choice_index))
-            holder = self._text_holder(choice)
             finished = choice.get("finish_reason") is not None
-            if holder is not None:
-                container, key = holder
-                original = container[key]
+
+            if choice.get("logprobs") is not None:
+                choice["logprobs"] = None  # token strings repeat the text and cannot be redacted one by one
+                changed = True
+
+            carried: set[RedactorKey] = set()
+            for key, container, name in _string_holders(choice, choice_index):
+                redactor = self._redactor(key)
+                carried.add(key)
+                original = container[name]
                 released = redactor.feed(original)
                 if finished:
                     released += redactor.flush()
                 if released != original:
-                    container[key] = released
-                    changed = True
-            elif finished and redactor.pending:
-                choice.setdefault("delta", {})["content"] = redactor.flush()
-                changed = True
-
-            for tool_index, function in self._tool_argument_holders(choice):
-                tool_redactor = self._redactor(self._tool_key(choice_index, tool_index))
-                original = function["arguments"]
-                released = tool_redactor.feed(original)
-                if finished:
-                    released += tool_redactor.flush()
-                if released != original:
-                    function["arguments"] = released
+                    container[name] = released
                     changed = True
 
             if finished:
-                changed = self._flush_tool_tails(choice, choice_index) or changed
+                changed = self._release_choice_tails(choice, choice_index, carried) or changed
             all_empty = all_empty and self._is_blank(choice)
 
         if not changed:
@@ -178,88 +241,28 @@ class StreamGuard:
         return [format_event(json.dumps(chunk, separators=(",", ":"), ensure_ascii=False), event.extra_lines)]
 
     @staticmethod
-    def _text_holder(choice: dict[str, Any]) -> tuple[dict[str, Any], str] | None:
-        delta = choice.get("delta")
-        if isinstance(delta, dict) and isinstance(delta.get("content"), str):
-            return delta, "content"
-        if isinstance(choice.get("text"), str):
-            return choice, "text"
-        return None
-
-    @staticmethod
-    def _tool_argument_holders(choice: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
-        delta = choice.get("delta")
-        calls = delta.get("tool_calls") if isinstance(delta, dict) else None
-        if not isinstance(calls, list):
-            return []
-        holders: list[tuple[int, dict[str, Any]]] = []
-        for position, call in enumerate(calls):
-            if not isinstance(call, dict):
-                continue
-            function = call.get("function")
-            if not isinstance(function, dict) or not isinstance(function.get("arguments"), str):
-                continue
-            tool_index = call.get("index") if isinstance(call.get("index"), int) else position
-            holders.append((tool_index, function))
-        return holders
-
-    def _flush_tool_tails(self, choice: dict[str, Any], choice_index: int) -> bool:
-        """Attach any tool-argument tails to the choice's final event."""
-        pending: list[tuple[int, str]] = []
-        for (kind, owner, tool_index), redactor in sorted(self._redactors.items()):
-            if kind == _TOOL and owner == choice_index and redactor.pending:
-                tail = redactor.flush()
-                if tail:
-                    pending.append((tool_index, tail))
-        if not pending:
-            return False
-
-        delta = choice.setdefault("delta", {})
-        if not isinstance(delta, dict):
-            delta = {}
-            choice["delta"] = delta
-        calls = delta.setdefault("tool_calls", [])
-        if not isinstance(calls, list):
-            calls = []
-            delta["tool_calls"] = calls
-
-        existing: dict[int, dict[str, Any]] = {}
-        for position, call in enumerate(calls):
-            if isinstance(call, dict):
-                index = call.get("index") if isinstance(call.get("index"), int) else position
-                existing[index] = call
-
-        for tool_index, tail in pending:
-            call = existing.get(tool_index)
-            if call is None:
-                call = {"index": tool_index, "function": {}}
-                calls.append(call)
-                existing[tool_index] = call
-            function = call.setdefault("function", {})
-            if not isinstance(function, dict):
-                function = {}
-                call["function"] = function
-            function["arguments"] = str(function.get("arguments", "")) + tail
-        return True
-
-    @staticmethod
     def _is_blank(choice: dict[str, Any]) -> bool:
         """True when the choice now carries no text and nothing else worth sending."""
         if choice.get("finish_reason") is not None:
             return False
         delta = choice.get("delta")
         if isinstance(delta, dict):
-            if set(delta) - {"content", "tool_calls"}:
+            if set(delta) - _BLANK_DELTA_KEYS:
                 return False
-            if delta.get("content") not in (None, ""):
+            if any(delta.get(name) not in (None, "") for name in TEXT_FIELDS):
+                return False
+            call = delta.get("function_call")
+            if call is not None and (
+                not isinstance(call, dict) or set(call) - {"arguments"} or call.get("arguments") not in (None, "")
+            ):
                 return False
             calls = delta.get("tool_calls", [])
             if not isinstance(calls, list):
                 return False
-            for call in calls:
-                if not isinstance(call, dict) or set(call) - {"index", "function"}:
+            for tool in calls:
+                if not isinstance(tool, dict) or set(tool) - {"index", "function"}:
                     return False
-                function = call.get("function")
+                function = tool.get("function")
                 if not isinstance(function, dict) or set(function) - {"arguments"}:
                     return False
                 if function.get("arguments") not in (None, ""):
