@@ -18,29 +18,39 @@ import uvicorn
 
 from .app import create_app
 from .providers import MockChatProvider
-from .redactor import HOLD_BOUND, StreamRedactor
+from .redactor import HOLD_BOUND, StreamRedactor, redact_text
 
 PROSE = "The quarterly report shows steady growth across regions, with support costs down 4%. "
 PII = "Contact jane.doe@example.com (SSN 123-45-6789) about card 4111 1111 1111 1111. "
 
 
-def _throughput(megabytes: float = 8.0, fragment: int = 6) -> None:
+def _throughput(megabytes: float = 2.0, fragment: int = 6) -> None:
     text = (PROSE * 20 + PII) * int(megabytes * 1_000_000 / (len(PROSE) * 20 + len(PII)))
     fragments = [text[i : i + fragment] for i in range(0, len(text), fragment)]
-    redactor = StreamRedactor()
-    tracemalloc.start()
+
+    def run() -> StreamRedactor:
+        redactor = StreamRedactor()
+        for part in fragments:
+            redactor.feed(part)
+        redactor.flush()
+        return redactor
+
     started = time.perf_counter()
-    released = 0
-    for part in fragments:
-        released += len(redactor.feed(part))
-    released += len(redactor.flush())
+    redactor = run()
     elapsed = time.perf_counter() - started
+    print(f"redactor   {len(text) / 1e6:.1f} MB in {len(fragments):,} fragments of {fragment} chars, {len(redactor._engine.detectors)} detectors")
+    print(f"           {len(text) / 1e6 / elapsed:.2f} MB/s, {elapsed / len(fragments) * 1e6:.1f} us/fragment")
+    started = time.perf_counter()
+    redact_text(text)
+    print(f"           whole text in one call: {len(text) / 1e6 / (time.perf_counter() - started):.1f} MB/s")
+
+    fragments = fragments[: len(fragments) // 4]  # memory is measured on a quarter: tracing slows everything down
+    tracemalloc.start()
+    redactor = run()
     _, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
-    print(f"redactor   {len(text) / 1e6:.1f} MB in {len(fragments):,} fragments of {fragment} chars")
-    print(f"           {len(text) / 1e6 / elapsed:.1f} MB/s, {elapsed / len(fragments) * 1e6:.1f} us/fragment")
     print(f"           peak traced memory {peak / 1024:.0f} KiB, max held {redactor.stats.max_buffered} chars (bound {HOLD_BOUND})")
-    print(f"           {redactor.stats.redactions:,} redactions")
+    print(f"           {redactor.stats.redactions:,} redactions on that quarter, by detector: {dict(redactor.stats.by_detector)}")
 
 
 class _Server:

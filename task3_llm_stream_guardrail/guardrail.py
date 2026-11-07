@@ -11,12 +11,13 @@ closing ``[DONE]`` event, preserving ordering without accumulating the response.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import aclosing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-from .redactor import StreamRedactor
+from .redactor import Engine, StreamRedactor, default_engine
 from .sse import DEFAULT_MAX_EVENT_BYTES, SSEEvent, SSEParser, format_event
 
 _TEXT = "text"
@@ -30,12 +31,18 @@ class GuardStats:
     events_out: int
     redactions: int
     max_buffered: int
+    by_detector: dict[str, int] = field(default_factory=dict)
 
 
 class StreamGuard:
-    """Feed upstream byte chunks to :meth:`process`; call :meth:`finish` when the stream ends."""
+    """Feed upstream byte chunks to :meth:`process`; call :meth:`finish` when the stream ends.
 
-    def __init__(self, max_event_bytes: int = DEFAULT_MAX_EVENT_BYTES) -> None:
+    ``engine`` decides what is redacted (see :mod:`.detectors`); the default covers every
+    built-in detector.
+    """
+
+    def __init__(self, max_event_bytes: int = DEFAULT_MAX_EVENT_BYTES, engine: Engine | None = None) -> None:
+        self._engine = engine or default_engine()
         self._parser = SSEParser(max_event_bytes)
         self._redactors: dict[RedactorKey, StreamRedactor] = {}
         self._template: dict[str, Any] = {}
@@ -46,11 +53,15 @@ class StreamGuard:
     @property
     def stats(self) -> GuardStats:
         redactors = self._redactors.values()
+        by_detector: Counter[str] = Counter()
+        for redactor in redactors:
+            by_detector.update(redactor.stats.by_detector)
         return GuardStats(
             events_in=self._events_in,
             events_out=self._events_out,
             redactions=sum(r.stats.redactions for r in redactors),
             max_buffered=max((r.stats.max_buffered for r in redactors), default=0),
+            by_detector=dict(by_detector),
         )
 
     # ------------------------------------------------------------------ public
@@ -78,7 +89,9 @@ class StreamGuard:
         return out
 
     def _redactor(self, key: RedactorKey) -> StreamRedactor:
-        return self._redactors.setdefault(key, StreamRedactor())
+        if key not in self._redactors:
+            self._redactors[key] = StreamRedactor(self._engine)
+        return self._redactors[key]
 
     @staticmethod
     def _text_key(choice_index: int) -> RedactorKey:

@@ -100,14 +100,59 @@ curl -N localhost:8082/v1/chat/completions -H 'content-type: application/json' \
      -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-Emails, SSNs (`123-45-6789`) and payment cards (13-19 digits, optional single spaces or dashes, **Luhn-validated** so order numbers are not mangled) become `[REDACTED]`. Set `UPSTREAM_URL`, `UPSTREAM_API_KEY` and `UPSTREAM_MODEL` to route to a real OpenAI-compatible provider.
+The guardrail is built from **detectors**: small, independent plug-ins that each recognise one kind of identifier. All of them run on every reply, and they match the *value*, never keywords: `jeff at jeff@aloha.com` is redacted whatever words surround the address. A match becomes `[REDACTED]` (only the value, when a label gives it away). Set `UPSTREAM_URL`, `UPSTREAM_API_KEY` and `UPSTREAM_MODEL` to route to a real OpenAI-compatible provider.
+
+| Detector | Catches | Example |
+|---|---|---|
+| `email` | addresses, Unicode included | `jeff@aloha.com`, `josé@münchen.de` |
+| `email_obfuscated` | addresses written to dodge filters | `jeff at aloha dot com`, `jeff[at]aloha.com` |
+| `phone` | numbers with a `+` code, brackets or separators | `(415) 555-0199`, `+44 20 7946 0958` |
+| `ssn` | US social security numbers | `123-45-6789` |
+| `card` | payment cards, Luhn-checked | `4111 1111 1111 1111` |
+| `iban` | bank accounts, checksum-checked | `GB82 WEST 1234 5698 7654 32` |
+| `ipv4`, `ipv6`, `mac` | network identifiers | `192.168.1.10`, `2001:db8::1`, `00:1A:2B:3C:4D:5E` |
+| `api_key`, `jwt`, `url_credentials`, `private_key` | credentials | `AKIA...`, `ghp_...`, `eyJ...`, `postgres://user:pw@host`, PEM blocks |
+| `ssn_labelled`, `phone_labelled`, `date_of_birth`, `passport`, `drivers_license`, `bank_account` | values only recognisable by the label before them | `SSN 123456789`, `passport no. X1234567`, `born on 3 May 1990`, `account number 12345678` |
+| `credential`, `stated_password`, `bearer_token` | secrets after a label | `password=hunter2`, `my password is hunter2`, `Bearer ...` |
+
+**Names, addresses and other free text.** No pattern can tell a person's name from any other capitalised word, so the guardrail does not guess: "my name is Jeff Smith" passes unless you tell it about Jeff. Three opt-in routes cover it:
+
+* a **word list** of names you know (customers, staff, code names), matched as whole words, case-insensitively;
+* your own **patterns** and **labelled values** (`EMP-123456`, `member id: AB12CD34`);
+* a **model**: wrap any function that returns spans, such as an NER model, in `CallableDetector`. It needs whole sentences to judge, so the unfinished sentence is held back; that is the price of context-sensitive detection. No model is bundled, and the hook has only been exercised with a stand-in function.
+
+Point `GUARDRAIL_CONFIG` at a JSON file to choose detectors and add your own. Unknown keys and invalid patterns stop the service from starting, so a typo cannot silently weaken it:
+
+```json
+{
+  "disable": ["ipv4"],
+  "terms": [{"name": "people", "terms": ["Jeff", "Jeff Smith", "Aloha Corp"]}],
+  "patterns": [{"name": "employee_id", "regex": "EMP-[0-9]{6}(?![0-9])", "max_length": 10}],
+  "labelled": [{"name": "member_id", "labels": ["member id"], "value": "[A-Z0-9]{8}(?![A-Za-z0-9])", "max_value_length": 8}],
+  "replacement": "[REDACTED:{label}]"
+}
+```
+
+`detectors` replaces the default list, `disable` removes names from whatever list is in force, and `{label}` in `replacement` becomes the detector's name (`[REDACTED:email]`).
+
+**Writing a detector.** A detector answers two questions: where are the matches (`spans`), and where might one still be growing (`pending`). The contract is written out in [`detectors/base.py`](task3_llm_stream_guardrail/detectors/base.py), and `verify_contract` checks a detector against it:
+
+```python
+from task3_llm_stream_guardrail.app import create_app
+from task3_llm_stream_guardrail.detectors import DEFAULT_NAMES, RegexDetector, build, verify_contract
+from task3_llm_stream_guardrail.redactor import Engine
+
+order = RegexDetector("order_id", r"ORD-[0-9]{8}(?![0-9])", max_span=12, run=r"\S")
+assert verify_contract(order, ["see ORD-12345678 now", "ORD-1234"]) == []
+app = create_app(provider, engine=Engine([*build(DEFAULT_NAMES), order]))
+```
 
 **How it stays fast and bounded** ([`redactor.py`](task3_llm_stream_guardrail/redactor.py)):
 
-* PII can span chunks (`"john@ex"` + `"ample.com"`), so a small tail has to be held back. The redactor holds only what could still grow into a match: the trailing run of e-mail characters, or the trailing run of digits/spaces/dashes from its first digit. Everything before that is final and released immediately. In ordinary prose the held tail is the last word, so the cost is about one token of latency.
-* The release point is never allowed to fall *inside* such a run. That is what makes streaming output byte-identical to redacting the whole text at once, whatever the chunk boundaries.
-* Memory does not depend on response length. Even delimiter-free input is capped at about 1.2 KB of held text.
-* Regexes are compiled once, the digit and e-mail patterns are only run when the text contains a digit or an `@`, and bytes are buffered until an SSE event is complete, so a multi-byte character split across network reads cannot corrupt a delta.
+* PII can span chunks (`"john@ex"` + `"ample.com"`, `"jeff at "` + `"aloha dot com"`), so a small tail has to be held back. Each detector reports where a match could still be growing and the redactor holds the text from the earliest such point; everything before it is final and released immediately. In ordinary prose only the last word is held, so the cost is about one token of latency.
+* The release point never falls inside a match that is already complete, and detectors see a few characters of text that was already released, so look-behind rules and labels such as `passport` behave exactly as they would on the whole text. That is what makes streamed output identical to redacting the whole text at once, whatever the chunk boundaries.
+* Memory does not depend on response length. No detector holds more than its `max_span`, so the engine holds at most a few KB (an unfinished PEM private key block is the largest, at 8 KB). A detector only holds a long token when it starts like one of its matches, so very long ordinary tokens (base64 blobs, minified code) cost almost nothing.
+* Regexes are compiled once, detectors skip text that cannot contain their trigger, and bytes are buffered until an SSE event is complete, so a multi-byte character split across network reads cannot corrupt a delta.
 * The held tail is released before the event carrying `finish_reason` or `[DONE]`, so nothing is lost and ordering is preserved. Normal text and every `choices[].delta.tool_calls[].function.arguments` stream have independent redactors, so PII split across tool-argument deltas is protected too. Events that carry no protected fields are forwarded as the original bytes.
 * Upstream failure before any output returns a clean `502`. A failure mid-stream delivers the (redacted) text already received, then a sanitised error event and `[DONE]`. A client disconnect closes the upstream call.
 
@@ -115,12 +160,12 @@ Measured with `python -m task3_llm_stream_guardrail.bench` (mock provider, loopb
 
 | | first text | complete |
 |---|---|---|
-| guarded | 29.8 ms | 3403.5 ms |
-| pass-through | 29.9 ms | 3403.4 ms |
+| guarded | 60.8 ms | 3406.5 ms |
+| pass-through | 30.3 ms | 3404.7 ms |
 
-Redactor throughput was about 4 MB/s on 6-character fragments (1.5 µs per fragment), with 3 KiB peak traced memory over an 8 MB stream and a maximum of 20 characters held.
+The extra ~30 ms before the first text is one delta: the last word is always held until the next arrives, so a disguised address such as `jeff at aloha dot com` can be recognised across chunks; the rest of the stream runs at the provider's pace (+1.8 ms over the whole reply; run-to-run variation is a few milliseconds). With all 22 detectors the redactor costs about 37 µs of CPU per 6-character fragment (roughly 0.2% of one core per stream at 50 tokens/s) and redacts about 3.2 MB/s when given a whole text in one call; over a 0.5 MB stream the peak traced memory was 11 KiB with at most 21 characters held.
 
-Detection limits are explicit: e-mail local parts are at most 64 characters, domains have at most eight 63-character labels plus a 24-character TLD (601 characters total); payment cards have at most 19 digits and SSNs are the 11-character dash-separated form. Values outside those limits are not suffix-matched as PII. The streaming buffer remains bounded at about 1.2 KB even for delimiter-free input. Bare nine-digit SSNs remain intentionally unsupported because they are too ambiguous.
+Detection limits are explicit: e-mail local parts are at most 64 characters, domains have at most eight 63-character labels plus a 24-character TLD (601 characters total), payment cards have at most 19 digits, and every other detector documents its `max_span`. Values outside the limits are not suffix-matched as PII. The heuristic detectors (labelled values, disguised addresses, phone numbers) can miss unusual formats and occasionally redact something harmless, such as a part number that looks like a phone number; any detector can be switched off by name in the config. **No filter can promise that every identifier is found.** A value the model splits up itself (`four one one one...`), spells out in words or encodes is not recognised, and names and addresses need a word list or a model as described above. Only `delta.content`, the legacy `text` field and tool-call arguments are inspected; [the assumptions](#assumptions-and-how-production-would-differ) list the fields that are not.
 
 ## Task 4: Rate limiting and model fallback router
 
@@ -198,22 +243,78 @@ A gateway with an oversized `JWT_LEEWAY_S` and a downstream that trusts the netw
         fix: The downstream trusts network position. Require a credential from the gateway (mTLS or a service token) ...
 ```
 
-## Assumptions and decisions
+## Assumptions and how production would differ
 
-* **Customer id** is `CUST-` plus five **upper-case alphanumeric** characters. The brief only says `CUST-XXXXX`; the pattern is a single constant in [`models.py`](task1_mcp_server/models.py).
-* **Bearer token = JWT** (HS256, shared secret) for the gateway.
-* **`tools/list` is forwarded untouched.** The task title mentions filtering, but the requirement says to forward it transparently, so I followed the requirement.
-* **Error codes** are the standard JSON-RPC ones (see the Task 1 table). Unknown tools use `-32602`, following the MCP specification's example, not `-32601`, which is reserved for unknown methods.
-* **Token estimates** use about 4 characters per token behind a single function (`estimate_tokens`), reconciled with the provider's reported usage.
-* **Mock providers** are used throughout, so nothing needs network access or credentials. The HTTP provider adapters for real OpenAI-compatible endpoints (Tasks 3 and 4) have not been run against a live provider.
-* **Compatibility.** Developed and run on Windows 11 with Python 3.14.3 and the pinned versions. I have not run it on Linux or macOS.
+The brief leaves some details open, and everything here runs against mocks so that no network access or credentials are needed. This section lists every assumption I made, what the code does about it, and how a live deployment would differ. Items marked **gap** are limitations that anyone relying on this code should know about.
+
+### Reading the brief
+
+| Assumption | Here | In production |
+|---|---|---|
+| Zero-trust troubleshooting is in scope | It is in the overview heading but no task specifies it, so I built [`zero_trust`](zero_trust) as a diagnostic CLI for the Task 2 deployment. | Probes see a deployment from one vantage point. They cannot see mesh authorisation policy, firewall rules, device posture or workload identity, so they complement config audits and flow logs rather than replace them. |
+| `tools/list` is forwarded untouched | The requirement says to forward it transparently while the task title mentions filtering. I followed the requirement, so a viewer can see the names of admin tools but cannot call them. | Filter the list per role, so a viewer cannot learn which privileged tools exist. |
+| Standard JSON-RPC error codes | Bad input is `-32602`, unknown tools included (the MCP specification's example), because `-32601` is for unknown methods. Gateway-specific codes are in the `-32000` range. | No difference expected. The gateway codes would be published as part of the API contract. |
+
+### Task 1: MCP server
+
+| Assumption | Here | In production |
+|---|---|---|
+| Customer id format | `CUST-` plus five upper-case letters or digits. The brief only says `CUST-XXXXX`; the pattern is one constant in [`models.py`](task1_mcp_server/models.py). | The format comes from the system of record. Keep the pattern as a cheap first check, align it with the real format, and let the backend decide whether the customer exists. |
+| Customer data | Four seeded customers held in memory. The record returns name and email as stored. | A CRM or billing service behind an API, with the fields returned limited to what the caller is allowed to see. |
+| Refunds | An in-memory list that disappears on exit. Amounts are floats rounded to cents, in USD. Nothing stops the same refund being issued twice, a suspended customer being refunded, or a refund larger than the original payment. | Integer minor units or `Decimal` with a currency, an idempotency key on every request, checks against the original payment and earlier refunds, approval thresholds, a durable audit trail, and the payment processor's API behind it. |
+| Authentication | None. A stdio server trusts whichever process launched it. | A remote MCP server needs real authentication (OAuth 2.1 under the MCP authorization specification). Task 2 stands in for that with a JWT. |
+
+### Task 2: MCP gateway
+
+| Assumption | Here | In production |
+|---|---|---|
+| Bearer token | HS256 JWT signed with a shared secret of at least 32 characters from the environment. The role comes from the `role` claim (`admin` or `viewer`); `iss` and `aud` are checked only if configured. | Tokens issued by an identity provider (OIDC), signed asymmetrically and verified against its published keys with rotation (`kid`), with `iss` and `aud` always required, short lifetimes and a revocation story. Roles come from IdP groups or a policy engine. The secret lives in a secrets manager. |
+| Authorisation rule | A `tools/call` whose name starts with `admin_` needs the `admin` role; everything else is allowed for any valid role. | An explicit per-tool policy (an allow-list by role or scope) enforced at the gateway, with the downstream enforcing its own checks too. A naming prefix is a convention, not a security boundary. |
+| Gateway to downstream | The gateway's own static bearer token (`DOWNSTREAM_TOKEN`), plus the verified identity in `X-Authenticated-User` and `X-Authenticated-Role`. | mTLS or workload identity with short-lived credentials. The downstream accepts identity headers only from the gateway (network policy), ideally as a signed assertion rather than plain headers. |
+| MCP sessions | `Mcp-Session-Id` is forwarded as received. **Gap:** the gateway does not tie a session to the caller who opened it. | Bind each session to the authenticated principal and reject any other caller presenting it. |
+| Transport and scale | Plain HTTP on `127.0.0.1`, one process, a 1 MiB body cap, a 30 s downstream timeout and no per-caller rate limit. | TLS at the ingress or mutual TLS in a mesh, several replicas, per-caller quotas, and limits tuned from real traffic. |
+| Audit trail | Log lines on stderr with request id, principal, decision and tool. Tokens are never logged. | Structured logs shipped to a SIEM with retention, and alerts on repeated denials or authentication failures. |
+
+### Task 3: streaming guardrail
+
+| Assumption | Here | In production |
+|---|---|---|
+| Provider format | OpenAI-style chat-completion SSE (`choices[].delta`), served by a mock provider by default. The HTTP adapter has not been run against a live provider. | Other vendors stream different event shapes, so each needs an adapter that maps its events onto the fields the guard protects. |
+| Fields that are redacted | `delta.content`, the legacy `text` field and `delta.tool_calls[].function.arguments`. **Gap:** `reasoning_content`, `refusal`, the legacy `function_call.arguments` and `logprobs` are forwarded unchanged; I tested each and they pass through. | Cover every text-bearing field the chosen provider can emit, and drop the ones that are not needed (`logprobs`, for one). |
+| Direction | Only the model's reply is scanned. | Also scan prompts before they leave your boundary, and keep PII out of your own logs. |
+| What counts as PII | Pattern, checksum and label based detectors for common US and European formats, plus optional word lists. Names and addresses are not detected on their own. Heuristics can miss unusual formats and occasionally redact harmless text. | Layered detection: locale-specific rules plus a trained entity recogniser, measured on labelled data for precision and recall, with the definition of PII agreed with compliance (GDPR, HIPAA, PCI) and redaction rates monitored. |
+| Access control | None; the endpoint is open. | Behind an authenticated gateway with per-tenant limits, such as Task 4's, in front. |
+| Latency and CPU | The last word is held back, which added about 30 ms before the first text in the benchmark, and the redactor costs about 37 µs of CPU per fragment in one Python process. | The delay is one gap between tokens at the provider's real cadence. Measure under concurrent load: one process shares its CPU across every stream, so scale out, or move the hot path to a faster runtime if profiling says so. |
+| Benchmark conditions | Mock provider, loopback, Windows (15.6 ms timer granularity). | Real network, TLS and token cadence; the numbers will differ. |
+
+### Task 4: rate limiter and router
+
+| Assumption | Here | In production |
+|---|---|---|
+| Tenant | Each API key is its own tenant (keys are hashed) with its own 50,000-token budget. Keys come from a comma-separated environment variable, so changing them needs a restart. | The tenant is the customer or organisation from the authenticated identity, so several keys can share one budget. Keys live in a secrets store or database with rotation and per-key metadata. |
+| What is counted | Prompt plus completion tokens against 50,000 per rolling minute. A request reserves a `characters / 4` estimate plus `max_tokens` (1024 when absent), then is settled to the provider's reported usage. | A tokenizer that matches the model, or the provider's token-count API; four characters per token is off for code and non-English text. Whether the budget covers input, output or both should follow the contract and billing. |
+| Storage | One SQLite file (WAL, `synchronous=NORMAL`), one row per request. | Correct for one node, or processes sharing a local disk. Several replicas need a shared store such as Redis or Postgres, because SQLite on a network filesystem is unsafe. At high request rates, aggregate into time buckets to cap the row count. An operating-system crash or power loss can lose the most recent writes under `NORMAL`, which allows brief over-admission. |
+| Clock | The system clock (`time.time`), because the window has to survive restarts. | Time taken from the shared store, so clock steps or skew between nodes cannot stretch or shrink the window. |
+| Failover triggers | Only a 429 or a 3000 ms timeout, as specified. Connection errors and 5xx responses are returned as errors unless `FAILOVER_ON_SERVER_ERRORS=1`. | Usually 5xx and connection errors fail over too, behind a circuit breaker so a dead primary stops being tried, with backoff and the primary's `Retry-After` honoured. |
+| The 3000 ms bound | Applies per attempt to the whole non-streaming completion, so two providers can take about 6 s in the worst case. Tokens consumed by a cancelled attempt are not charged to the tenant. | For streaming, time to first token is the sensible bound; a 3 s cap on a full answer trips on any long reply. Cancelled attempts are counted conservatively or reconciled against provider billing. |
+| Backup model | Treated as a drop-in replacement. Each provider's model is pinned in its configuration, so the client's `model` field is accepted but not forwarded. | Models differ in quality, context length, tokenizer, price and data-handling terms, so failing over to another vendor may need prompt changes and compliance sign-off. A routing table maps requested models to providers. |
+| Scope | Non-streaming only, and Tasks 3 and 4 are separate services. | One gateway pipeline: authenticate, limit, route with failover, then guard the stream. |
+
+### Across the project
+
+| Assumption | Here | In production |
+|---|---|---|
+| Platform | Developed and run on Windows 11 with Python 3.14.3 and the pinned versions. I have not run it on Linux or macOS. | Containers, CI on the target operating system, and dependency scanning. |
+| Secrets | Environment variables. | A secrets manager with rotation. |
+| Observability | `/healthz` (liveness only) and logs on stderr. | Readiness checks, metrics (latency, denials, failover and redaction rates) and tracing. |
+| Error detail | Clients get fixed messages and a request id; details stay in the server log. | The same, with the logs centralised and access-controlled. |
 
 ## Layout
 
 ```
 task1_mcp_server/            MCP server, strict models, stdio transport wrapper
 task2_mcp_gateway/           JWT auth, JSON-RPC parsing, policy, proxy, mock downstream
-task3_llm_stream_guardrail/  redactor, SSE parser, stream guard, endpoint, benchmark
+task3_llm_stream_guardrail/  redaction engine, detectors/ (framework + built-ins), config, SSE parser, stream guard, endpoint, benchmark
 task4_llm_router/            SQLite limiter, router, providers, endpoint
 zero_trust/                  probes, token inspector, network diagnosis, CLI
 ```

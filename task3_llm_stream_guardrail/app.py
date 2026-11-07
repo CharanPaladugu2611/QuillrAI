@@ -18,7 +18,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from .errors import ERROR_CATALOG, UpstreamError, UpstreamTimeout, error_body
 from .guardrail import StreamGuard, guard_stream
 from .providers import ChatProvider
-from .redactor import redact_text
+from .redactor import Engine, default_engine, redact_text
 from .sse import SSEProtocolError, format_event
 
 logger = logging.getLogger(__name__)
@@ -42,26 +42,30 @@ class ChatRequest(BaseModel):
     stream: bool = False
 
 
-def _redact_completion(payload: dict[str, Any]) -> dict[str, Any]:
+def _redact_completion(payload: dict[str, Any], engine: Engine) -> dict[str, Any]:
     """Non-streaming replies are a single bounded JSON document, redacted in one pass."""
     for choice in payload.get("choices", []):
         if not isinstance(choice, dict):
             continue
         message = choice.get("message")
         if isinstance(message, dict) and isinstance(message.get("content"), str):
-            message["content"] = redact_text(message["content"])[0]
+            message["content"] = redact_text(message["content"], engine)[0]
         if isinstance(message, dict) and isinstance(message.get("tool_calls"), list):
             for call in message["tool_calls"]:
                 function = call.get("function") if isinstance(call, dict) else None
                 if isinstance(function, dict) and isinstance(function.get("arguments"), str):
-                    function["arguments"] = redact_text(function["arguments"])[0]
+                    function["arguments"] = redact_text(function["arguments"], engine)[0]
         if isinstance(choice.get("text"), str):
-            choice["text"] = redact_text(choice["text"])[0]
+            choice["text"] = redact_text(choice["text"], engine)[0]
     return payload
 
 
-def create_app(provider: ChatProvider, *, redact: bool = True) -> FastAPI:
-    """``redact=False`` turns the guard into a plain pass-through (used to measure its overhead)."""
+def create_app(provider: ChatProvider, *, redact: bool = True, engine: Engine | None = None) -> FastAPI:
+    """``engine`` chooses what is redacted (default: every built-in detector).
+
+    ``redact=False`` turns the guard into a plain pass-through (used to measure its overhead).
+    """
+    engine = engine or default_engine()
     app = FastAPI(title="LLM gateway with stream guardrail", docs_url=None, redoc_url=None, openapi_url=None)
 
     def failure(code: str, request: Request) -> JSONResponse:
@@ -104,9 +108,9 @@ def create_app(provider: ChatProvider, *, redact: bool = True) -> FastAPI:
                 return failure("upstream_timeout", request)
             except UpstreamError:
                 return failure("upstream_error", request)
-            return JSONResponse(_redact_completion(completion) if redact else completion)
+            return JSONResponse(_redact_completion(completion, engine) if redact else completion)
 
-        guard = StreamGuard()
+        guard = StreamGuard(engine=engine)
         source = provider.stream(payload)
         events = guard_stream(source, guard) if redact else source
 
@@ -142,13 +146,14 @@ def create_app(provider: ChatProvider, *, redact: bool = True) -> FastAPI:
                 await events.aclose()  # propagates to the provider call (client disconnects land here)
                 stats = guard.stats
                 logger.info(
-                    "stream done request_id=%s first_chunk_ms=%.1f total_ms=%.1f chunks=%d redactions=%d max_held=%d",
+                    "stream done request_id=%s first_chunk_ms=%.1f total_ms=%.1f chunks=%d redactions=%d max_held=%d types=%s",
                     request_id,
                     (first_chunk_at - started) * 1000,
                     (time.perf_counter() - started) * 1000,
                     chunks,
                     stats.redactions,
                     stats.max_buffered,
+                    ",".join(f"{name}:{count}" for name, count in sorted(stats.by_detector.items())) or "-",
                 )
 
         return StreamingResponse(body_iterator(), media_type="text/event-stream", headers=_STREAM_HEADERS)
